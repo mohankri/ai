@@ -222,7 +222,30 @@ GPU before being passed to the model.
 bias). LayerNorms are intentionally skipped, keeping PyTorch's default
 weight=1 / bias=0.
 
-### 4. Optimizer — line 54
+### 4. Counting parameters — line 48
+
+```python
+n_params = sum(p.numel() for p in model.parameters())
+```
+
+`model.parameters()` provides every parameter tensor in the GPT model. For each
+tensor, `p.numel()` returns the number of individual scalar values it contains.
+`sum()` adds those counts together, producing the total number of model
+parameters. In this model the total is `25,417,728`, displayed as `25.4M` by
+dividing by `1e6` in the print statement.
+
+For example, a parameter tensor with shape `(512, 512)` contributes
+`512 x 512 = 262,144` parameters.
+
+```mermaid
+flowchart LR
+  Model["GPT model"] --> Tensors["All parameter tensors"]
+  Tensors --> Count["p.numel() for each tensor"]
+  Count --> Total["sum(...) = 25,417,728"]
+  Total --> Display["n_params / 1e6 = 25.4M params"]
+```
+
+### 5. Optimizer — line 54
 
 ```python
 torch.optim.AdamW(model.parameters(), lr=3e-4, betas=(0.9, 0.95), weight_decay=0.1)

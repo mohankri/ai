@@ -44,6 +44,7 @@ def main():
     # Build reproducible weights on CPU, then move the complete model to GPU 0.
     model = build_model(cfg).to(device)
 
+    # Count every scalar value stored in every model parameter tensor.
     n_params = sum(p.numel() for p in model.parameters())
     print(f"model: {n_params/1e6:.1f}M params, {cfg.n_layer} blocks, "
           f"d_model={cfg.d_model}, {cfg.n_head} heads, block_size={cfg.block_size}")
