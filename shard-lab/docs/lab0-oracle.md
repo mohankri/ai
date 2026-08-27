@@ -245,10 +245,65 @@ flowchart LR
   Total --> Display["n_params / 1e6 = 25.4M params"]
 ```
 
-### 5. Optimizer — line 54
+### 5. Inspecting parameter layout — line 57
+
+```python
+describe_shards(model)
+```
+
+This walks through `model.named_parameters()` and prints each parameter's name
+and shape. It also adds the number of local parameter values to a total and
+summarizes repeated transformer blocks. In Lab 0, `global_shapes` is omitted,
+so every parameter is on the one GPU and no `SHARDED` marker is needed. Later
+labs pass global shapes so a smaller local shape can be identified as a shard.
+
+```mermaid
+flowchart TD
+  Model["GPT model"] --> Parameters["model.named_parameters()"]
+  Parameters --> Details["Parameter name + local shape"]
+  Parameters --> Elements["p.numel() for each parameter"]
+  Elements --> Total["Local parameter total"]
+  Details --> Summary["Printed parameter layout"]
+  Total --> Summary
+  Summary --> Check["Verify layout before training"]
+```
+
+### 6. Optimizer — line 54
 
 ```python
 torch.optim.AdamW(model.parameters(), lr=3e-4, betas=(0.9, 0.95), weight_decay=0.1)
+```
+
+This creates an AdamW optimizer for all parameters returned by
+`model.parameters()`. After `loss.backward()` computes gradients, `opt.step()`
+uses those gradients to update the model weights.
+
+- `lr=3e-4` is the learning rate: the size of each update.
+- `betas=(0.9, 0.95)` control the exponential moving averages of the gradient
+  and squared gradient. The second value is lower than PyTorch's default
+  `0.999`, which is common in language-model training.
+- `weight_decay=0.1` applies decoupled weight decay, gently pulling parameters
+  toward zero and helping limit overfitting.
+
+The `LR` constant in the script supplies the learning rate:
+
+```python
+LR = 3e-4
+opt = torch.optim.AdamW(model.parameters(), lr=LR, betas=(0.9, 0.95),
+                        weight_decay=0.1)
+```
+
+```mermaid
+flowchart LR
+    Model["GPT model parameters"] --> Optimizer["AdamW optimizer"]
+    Loss["Training loss"] --> Backward["loss.backward()"]
+    Backward --> Gradients["Parameter gradients"]
+    Gradients --> Optimizer
+    Optimizer --> Step["opt.step()"]
+    Step --> Updated["Updated model parameters"]
+    LR["lr = 3e-4"] --> Optimizer
+    Betas["betas = (0.9, 0.95)"] --> Optimizer
+    Decay["weight_decay = 0.1"] --> Optimizer
 ```
 
 `betas=(0.9, 0.95)` is the LLM convention, not torch's `(0.9, 0.999)` default.
@@ -258,7 +313,51 @@ biases and LayerNorm gains. Real training excludes those. It does not matter
 here because the oracle only has to be self-consistent — but do not copy this
 into a real run.
 
-### 5. The training loop — lines 61-71
+### 7. The training loop — lines 61-71
+
+```python
+model.train()
+```
+
+`model.train()` switches the model and all of its child modules into training
+mode. This matters for layers whose behavior differs between training and
+evaluation, such as dropout and batch normalization. The GPT model in this
+lab does not use either layer, so the call does not change its current forward
+calculation, but it establishes the correct mode before optimization begins.
+
+The corresponding evaluation call appears later as `model.eval()` before the
+fixed probe forward pass.
+
+Before the training loop, CUDA memory accounting is reset:
+
+```python
+torch.cuda.reset_peak_memory_stats()
+```
+
+PyTorch tracks the highest amount of GPU memory allocated since the last reset.
+This call clears that peak counter after the model has been moved to the GPU and
+before training starts. The later `mem_report("single GPU")` can therefore
+report the peak memory caused by the training run, rather than including stale
+allocations from earlier setup work. It does not free memory or change the
+model; it only resets the measurement counter.
+
+```mermaid
+flowchart LR
+  Setup["Model setup on GPU"] --> Reset["reset_peak_memory_stats()"]
+  Reset --> Training["Forward + backward + optimizer"]
+  Training --> Peak["Peak allocation recorded"]
+  Peak --> Report["mem_report()"]
+```
+
+```mermaid
+flowchart LR
+  Model["GPT model"] --> Train["model.train()"]
+  Train --> Mode["Training mode enabled"]
+  Mode --> Forward["Training forward pass"]
+  Forward --> Loss["Compute loss and gradients"]
+  Loss --> Update["Optimizer updates parameters"]
+  Mode -. later .-> Eval["model.eval() for probe"]
+```
 
 ```python
 timer.tick(step)
@@ -271,6 +370,79 @@ opt.step()
 losses.append(loss.item())
 ```
 
+After backpropagation, the gradients are clipped before the optimizer update:
+
+```python
+torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
+```
+
+This computes the combined norm of all parameter gradients. If that norm is
+greater than `1.0`, PyTorch scales the gradients down so the total norm is
+`1.0`; if it is already below `1.0`, the gradients are unchanged. Clipping
+limits unusually large updates and helps keep training numerically stable. It
+does not clip the parameters themselves and does not change the loss value.
+
+In Lab 0, `model.parameters()` contains the complete model, so this is a global
+gradient norm. In a distributed or sharded model, local-only clipping can give a
+different result unless the global norm is computed across ranks.
+
+```mermaid
+flowchart LR
+  Backward["loss.backward()"] --> Gradients["Gradients for all parameters"]
+  Gradients --> Norm["Compute global gradient norm"]
+  Norm --> Decision{"Norm > 1.0?"}
+  Decision -->|No| Unchanged["Keep gradients"]
+  Decision -->|Yes| Scale["Scale gradients down"]
+  Unchanged --> Step["opt.step()"]
+  Scale --> Step
+```
+
+The optimizer applies the gradients with:
+
+```python
+opt.step()
+```
+
+AdamW reads each parameter's gradient from its `.grad` field and updates the
+parameter using the learning rate, moving averages, and weight decay configured
+when the optimizer was created. This is the line that changes the model's
+weights. It must run after `loss.backward()` and gradient clipping; running it
+before either operation would use missing or stale gradients.
+
+After the update, the next iteration obtains a new batch and repeats the same
+forward, backward, and update cycle.
+
+```mermaid
+flowchart LR
+  Gradients["Clipped parameter gradients"] --> AdamW["AdamW optimizer"]
+  AdamW --> Update["opt.step()"]
+  Update --> Weights["Updated model weights"]
+  Weights --> Next["Next training batch"]
+  Next --> Forward["Forward pass"]
+```
+
+After the optimizer update, the current loss is saved:
+
+```python
+losses.append(loss.item())
+```
+
+`loss` is a zero-dimensional PyTorch tensor, usually stored on the GPU.
+`loss.item()` extracts its single value as a regular Python number, and
+`losses.append(...)` adds that value to the list for the current step. Calling
+`.item()` also synchronizes with the GPU, ensuring the loss value is ready
+before it is recorded. The list is later printed and saved in `reference.pt`
+so other labs can compare their loss curve with this oracle.
+
+```mermaid
+flowchart LR
+  Model["Model computes loss tensor"] --> Item["loss.item()"]
+  Item --> Scalar["Python scalar"]
+  Scalar --> History["losses list"]
+  History --> Report["Print first/final losses"]
+  History --> Oracle["Save and compare loss curve"]
+```
+
 Five things worth knowing:
 
 **`get_batch(step)` is world-size independent.** A fresh
@@ -278,6 +450,112 @@ Five things worth knowing:
 batch depends only on the step number. `rank`/`world` default to `0`/`1` here;
 later labs pass real values and take a slice of the *same* batch.
 `x = data[i:i+256]`, `y = data[i+1:i+1+256]` is the standard next-token shift.
+
+The training loop calls it as follows:
+
+```python
+x, y = get_batch(data, step, GLOBAL_BATCH, cfg.block_size, device)
+```
+
+`get_batch()` uses the current `step` to seed a random generator, selects 32
+starting positions from the encoded corpus, and extracts 256-token sequences.
+`x` contains the input sequences and `y` contains the same sequences shifted
+one character forward. The model therefore learns to predict the next
+character at every position. Both tensors are moved to the selected GPU before
+being returned.
+
+In Lab 0, their shapes are `(32, 256)`: 32 sequences per batch and 256 token
+positions per sequence. The target sequence is offset by one position, not a
+separate label for the whole sequence.
+
+```mermaid
+flowchart LR
+  Corpus["Encoded corpus"] --> Sample["Deterministic positions<br/>seed + step"]
+  Sample --> Inputs["x: input sequences<br/>32 x 256 tokens"]
+  Sample --> Targets["y: next-token targets<br/>32 x 256 tokens"]
+  Inputs --> Device["Move x and y to device"]
+  Targets --> Device
+  Device --> Model["model(x, y)"]
+```
+
+The model is called with both the inputs and their expected next characters:
+
+```python
+_, loss = model(x, y)
+```
+
+Inside `GPT.forward`, `x` is passed through the transformer and produces
+`logits`, which are 65 scores for every token position. Because `y` is
+provided, the model also compares those scores with the expected next-token
+IDs using cross-entropy and returns the resulting scalar `loss`.
+
+The model returns two values: `(logits, loss)`. The underscore `_` deliberately
+discards `logits` because the training loop only needs `loss` for
+backpropagation. Later, the probe forward pass keeps both values to compare
+the model's predictions against the saved oracle.
+
+```mermaid
+flowchart LR
+  X["x: input tokens"] --> Forward["GPT.forward(x, y)"]
+  Y["y: expected next tokens"] --> Forward
+  Forward --> Logits["logits: 65 scores per position"]
+  Logits --> CrossEntropy["Cross-entropy with y"]
+  Y --> CrossEntropy
+  CrossEntropy --> Loss["loss: one scalar"]
+  Loss --> Backward["loss.backward()"]
+```
+
+Backpropagation is performed with:
+
+```python
+loss.backward()
+```
+
+During the forward pass, PyTorch autograd records the operations that produce
+the loss. This call traverses that computation graph in reverse and applies the
+chain rule to calculate the derivative of the loss with respect to every model
+parameter. Each result is stored in that parameter's `.grad` field, where the
+optimizer can use it during `opt.step()`.
+
+The gradients describe the direction and strength of the change needed to
+reduce the loss. `loss.backward()` computes gradients but does not update the
+parameters itself; gradient clipping and the optimizer update happen afterward.
+
+```mermaid
+flowchart TD
+  Forward["Forward operations"] --> Graph["Autograd computation graph"]
+  Graph --> Loss["Scalar loss"]
+  Loss --> Backward["loss.backward()"]
+  Backward --> Chain["Reverse-mode chain rule"]
+  Chain --> Gradients["parameter.grad for every parameter"]
+  Gradients --> Clip["Gradient clipping"]
+  Clip --> Optimizer["opt.step() updates parameters"]
+```
+
+Before calculating the gradients for the current batch, the optimizer clears
+the gradients left by the previous batch:
+
+```python
+opt.zero_grad(set_to_none=True)
+```
+
+PyTorch accumulates gradients in each parameter's `.grad` field by default. If
+old gradients were not cleared, every update would combine gradients from
+multiple batches and the training result would be wrong. `set_to_none=True`
+sets each gradient field to `None` instead of filling an existing tensor with
+zeros. This can reduce memory operations and lets PyTorch allocate a fresh
+gradient tensor during the next backward pass.
+
+The intended order is:
+
+```mermaid
+flowchart LR
+  Forward["Forward pass"] --> Clear["opt.zero_grad(set_to_none=True)"]
+  Clear --> Backward["loss.backward()"]
+  Backward --> Update["opt.step()"]
+  Update --> Next["Next batch"]
+  Next --> Forward
+```
 
 **`zero_grad` sits after the forward.** Unusual placement but correct —
 gradients are consumed only during `backward()`. What matters is that it
@@ -297,20 +575,66 @@ over local shards only, under-clips, and shifts the loss by 7.1e-02.
 arguably makes the timing more honest, but you would not do this in a
 throughput-sensitive loop.
 
-### 6. Timing — 90 steps, not 100
+### 8. Timing — 90 steps, not 100
 
 `StepTimer(warmup=10)` starts the clock at step 10 after a
 `cuda.synchronize()`. All 100 steps still execute, so the loss curve is
 unaffected. It exists because the first run of this file reported 23.7s, of
 which roughly 19 seconds were one-time JIT compilation.
 
-### 7. The probe forward — lines 81-84
+### 9. The probe forward — lines 81-84
 
 ```python
 model.eval()
 with torch.no_grad():
     xr, yr = get_batch(data, 10_000, 8, cfg.block_size, device)
     ref_logits, ref_loss = model(xr, yr)
+```
+
+`model.eval()` switches the model and all child modules to evaluation mode
+before the fixed probe forward pass. It reverses the training-mode setting from
+`model.train()` and makes layers such as dropout or batch normalization use
+inference behavior. This GPT model has neither layer, so its immediate numeric
+output is unchanged, but the evaluation boundary is explicit.
+
+`model.eval()` does not disable gradient tracking by itself. The surrounding
+`torch.no_grad()` context does that separately. Together, they avoid training-
+time behavior and avoid building an autograd graph, reducing unnecessary memory
+use during the reference check.
+
+```mermaid
+flowchart LR
+  Trained["Trained model"] --> Eval["model.eval()"]
+  Eval --> Mode["Evaluation mode"]
+  Mode --> NoGrad["torch.no_grad()"]
+  NoGrad --> Probe["Fixed probe forward pass"]
+  Probe --> Saved["Reference logits and loss"]
+```
+
+The block then creates a deterministic probe batch and runs the model:
+
+```python
+with torch.no_grad():
+    xr, yr = get_batch(data, 10_000, 8, cfg.block_size, device)
+    ref_logits, ref_loss = model(xr, yr)
+```
+
+`torch.no_grad()` prevents autograd from recording operations because this pass
+is for measurement, not training. `xr` and `yr` contain 8 input/target
+sequences of length 256. The resulting `ref_logits` and `ref_loss` are saved
+in `reference.pt` so later labs can compare their forward output against the
+same trained model and the same probe data.
+
+```mermaid
+flowchart TD
+  Seed["probe_step = 10,000"] --> Batch["get_batch(..., 8, 256, device)"]
+  Batch --> Inputs["xr and yr"]
+  Inputs --> NoGrad["torch.no_grad()"]
+  NoGrad --> Forward["model(xr, yr)"]
+  Forward --> Logits["ref_logits"]
+  Forward --> Loss["ref_loss"]
+  Logits --> Save["Save in reference.pt"]
+  Loss --> Save
 ```
 
 `step=10_000` is deliberately far outside the training range `0..99`, so the
@@ -321,10 +645,60 @@ This gives Lab 3 a **pure forward-pass check**. Comparing logits on a fixed
 batch isolates forward bugs from anything in the optimizer trajectory, which is
 how the missing-`f` bug was pinned to gradients specifically.
 
-### 8. Save — line 87
+### 10. Save — line 87
 
 `state_dict` is moved to CPU so it loads anywhere. `cfg` is a pickled
 dataclass, which is why every reader passes `weights_only=False`.
+
+The complete oracle artifact is written with:
+
+```python
+torch.save(
+    {
+        "losses": losses,
+        "state_dict": {k: v.cpu() for k, v in model.state_dict().items()},
+        "cfg": cfg,
+        "global_batch": GLOBAL_BATCH,
+        "steps": STEPS,
+        "lr": LR,
+        "probe_step": 10_000,
+        "probe_batch": 8,
+        "ref_logits": ref_logits.cpu(),
+        "ref_loss": ref_loss.item(),
+    },
+    REFERENCE,
+)
+```
+
+`torch.save()` serializes the dictionary to `out/reference.pt`. The entries
+serve different purposes:
+
+- `losses` stores the loss from every training step for curve comparison.
+- `state_dict` stores the final model weights; `.cpu()` removes the dependency
+  on the training GPU when the file is loaded.
+- `cfg`, `global_batch`, `steps`, and `lr` record the training configuration.
+- `probe_step` and `probe_batch` record how the fixed validation batch was made.
+- `ref_logits` stores the probe predictions, and `ref_loss` stores its scalar
+  loss, allowing later labs to check their forward pass directly.
+
+`ref_loss.item()` converts the one-value tensor to a regular Python number, and
+`REFERENCE` supplies the output path defined in `common.py`.
+
+```mermaid
+flowchart TD
+  Training["Training loop"] --> History["losses"]
+  Training --> Weights["model.state_dict()"]
+  Config["GPT configuration"] --> Checkpoint["Dictionary"]
+  Probe["Reference probe"] --> Logits["ref_logits"]
+  Probe --> Loss["ref_loss.item()"]
+  History --> Checkpoint
+  Weights --> CPU["Move weights to CPU"]
+  CPU --> Checkpoint
+  Logits --> Checkpoint
+  Loss --> Checkpoint
+  Checkpoint --> Save["torch.save(...)"]
+  Save --> File["out/reference.pt"]
+```
 
 ### A sanity check worth knowing
 

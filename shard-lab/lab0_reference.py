@@ -51,23 +51,35 @@ def main():
     print(f"data:  {len(data):,} tokens, vocab {vocab_size}")
     print(f"train: {STEPS} steps, global batch {GLOBAL_BATCH}, fp32\n")
 
+    # Inspect parameter names and shapes before training; this is the full
+    # model layout because Lab 0 runs on one GPU.
     describe_shards(model)
 
+    # Configure AdamW to update every model parameter after backpropagation.
     opt = torch.optim.AdamW(model.parameters(), lr=LR, betas=(0.9, 0.95),
                             weight_decay=0.1)
 
     losses = []
+    # Enable training behavior for the model before the optimization loop.
     model.train()
+    # Start peak-memory accounting after model setup and before training.
     torch.cuda.reset_peak_memory_stats()
     timer = StepTimer()
     for step in range(STEPS):
         timer.tick(step)
+        # Select a deterministic batch of input sequences and next-token targets.
         x, y = get_batch(data, step, GLOBAL_BATCH, cfg.block_size, device)
+        # Run the model and keep the training loss; logits are unused here.
         _, loss = model(x, y)
+        # Clear old gradients before computing this step's gradients.
         opt.zero_grad(set_to_none=True)
+        # Use autograd to compute gradients of the loss for every parameter.
         loss.backward()
+        # Limit the global gradient norm to keep parameter updates stable.
         torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
+        # Apply the clipped gradients to update the model parameters.
         opt.step()
+        # Convert the loss to a Python number and record this training step.
         losses.append(loss.item())
         if step % 20 == 0 or step == STEPS - 1:
             print(f"  step {step:3d}  loss {loss.item():.6f}")
@@ -80,12 +92,15 @@ def main():
     # A single reference forward pass on a fixed batch.  Lab 3 compares logits
     # against this directly, which localises tensor-parallel bugs to the
     # forward pass instead of hiding them in an optimizer trajectory.
+    # Switch to evaluation behavior before generating the reference output.
     model.eval()
+    # Run the fixed reference pass without storing an autograd graph.
     with torch.no_grad():
         xr, yr = get_batch(data, 10_000, 8, cfg.block_size, device)
         ref_logits, ref_loss = model(xr, yr)
 
     os.makedirs(OUT_DIR, exist_ok=True)
+    # Save training history, configuration, weights, and probe results.
     torch.save(
         {
             "losses": losses,
