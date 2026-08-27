@@ -94,6 +94,190 @@ Each rank then takes its slice. A 4-GPU run therefore consumes exactly the same
 tokens in exactly the same order as the 1-GPU oracle, so any divergence in the
 loss curve is a bug in your parallelism and not a difference in data.
 
+## Code workflow
+
+Execution order, with the parts that are load-bearing called out. Line numbers
+refer to `lab0_reference.py` unless stated.
+
+### 0. Import side effects, before `main()` runs
+
+`common.py:27` sets an environment variable *between* the `os` import and the
+`torch` import:
+
+```python
+os.environ.setdefault("CUBLAS_WORKSPACE_CONFIG", ":4096:8")
+import torch  # line 33
+```
+
+Not stylistic. cuBLAS reads that variable when it initialises, and without it
+several reductions pick workspace-dependent split-K strategies that are not
+reproducible run to run. **It must precede the first CUDA context.** Placing it
+after the `torch` import happens to work today (importing torch does not create
+a context) but it is a latent trap.
+
+`common.py:38` sets `HERE = os.path.dirname(os.path.abspath(__file__))`, and
+every path derives from it. That is why moving the tree does not break anything —
+nothing resolves against the current working directory.
+
+### 1. `set_determinism(0)` — line 39
+
+Four settings, one of which carries the weight: `allow_tf32 = False`. See design
+decision 2 above.
+
+`use_deterministic_algorithms(True, warn_only=True)` is deliberate — embedding
+scatter-add in the backward has no deterministic kernel. You get a warning, not
+a crash, and the residual nondeterminism is far below the comparison tolerance.
+The next section proves that empirically rather than assuming it.
+
+### 2. `load_data()` — line 42
+
+Vocabulary is **discovered, not configured**:
+
+```python
+chars = sorted(set(text))
+stoi = {c: i for i, c in enumerate(chars)}
+```
+
+`sorted()` matters. A raw `set` would give a mapping that could shift between
+runs, silently changing the data and therefore the loss curve. Returns
+`vocab=65`, which overrides the `GPTConfig` default at line 43.
+
+### 3. `build_model(cfg).to(device)` — line 44
+
+The re-seed is the critical part:
+
+```python
+def build_model(cfg=None, seed=0):      # common.py:358
+    torch.manual_seed(seed)             # re-seeds, unconditionally
+    return GPT(cfg)
+```
+
+The seed is set *inside* `build_model`, not merely once at startup, so
+construction is independent of whatever consumed RNG beforehand. In Labs 2-7,
+where every rank calls this, that is what guarantees all four ranks build
+byte-identical weights before any sharding — the precondition for the entire
+oracle comparison.
+
+It builds on **CPU** and then moves to the device, so initialisation uses CPU
+RNG and cannot be perturbed by per-GPU RNG state.
+
+`GPT._init` touches only `Linear` and `Embedding` (`normal_(std=0.02)`, zero
+bias). LayerNorms are intentionally skipped, keeping PyTorch's default
+weight=1 / bias=0.
+
+### 4. Optimizer — line 54
+
+```python
+torch.optim.AdamW(model.parameters(), lr=3e-4, betas=(0.9, 0.95), weight_decay=0.1)
+```
+
+`betas=(0.9, 0.95)` is the LLM convention, not torch's `(0.9, 0.999)` default.
+
+One honest simplification: weight decay is applied to **everything**, including
+biases and LayerNorm gains. Real training excludes those. It does not matter
+here because the oracle only has to be self-consistent — but do not copy this
+into a real run.
+
+### 5. The training loop — lines 61-71
+
+```python
+timer.tick(step)
+x, y = get_batch(data, step, GLOBAL_BATCH, cfg.block_size, device)
+_, loss = model(x, y)
+opt.zero_grad(set_to_none=True)
+loss.backward()
+torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
+opt.step()
+losses.append(loss.item())
+```
+
+Five things worth knowing:
+
+**`get_batch(step)` is world-size independent.** A fresh
+`torch.Generator().manual_seed(1234 + step)` picks the indices, so the global
+batch depends only on the step number. `rank`/`world` default to `0`/`1` here;
+later labs pass real values and take a slice of the *same* batch.
+`x = data[i:i+256]`, `y = data[i+1:i+1+256]` is the standard next-token shift.
+
+**`zero_grad` sits after the forward.** Unusual placement but correct —
+gradients are consumed only during `backward()`. What matters is that it
+precedes `backward()`.
+
+**`set_to_none=True` frees the gradient tensors** rather than zeroing them.
+Harmless here; in Lab 5 it is the mechanism behind the ZeRO-1 NaN bug, because
+`opt.zero_grad()` on a subset-owning optimizer leaves the other gradients alive
+and accumulating.
+
+**`clip_grad_norm_` is correct here and only here.** On one GPU
+`model.parameters()` is the whole model, so the norm is genuinely global. This
+exact line, unchanged, is bug (e) in Lab 3: under tensor parallelism it norms
+over local shards only, under-clips, and shifts the loss by 7.1e-02.
+
+**`loss.item()` forces a device sync every step.** Fine for an oracle, and it
+arguably makes the timing more honest, but you would not do this in a
+throughput-sensitive loop.
+
+### 6. Timing — 90 steps, not 100
+
+`StepTimer(warmup=10)` starts the clock at step 10 after a
+`cuda.synchronize()`. All 100 steps still execute, so the loss curve is
+unaffected. It exists because the first run of this file reported 23.7s, of
+which roughly 19 seconds were one-time JIT compilation.
+
+### 7. The probe forward — lines 81-84
+
+```python
+model.eval()
+with torch.no_grad():
+    xr, yr = get_batch(data, 10_000, 8, cfg.block_size, device)
+    ref_logits, ref_loss = model(xr, yr)
+```
+
+`step=10_000` is deliberately far outside the training range `0..99`, so the
+generator produces a batch the model never trained on. Batch 8 keeps
+`ref_logits` small — `8 x 256 x 65` floats, about 532 KB in the saved file.
+
+This gives Lab 3 a **pure forward-pass check**. Comparing logits on a fixed
+batch isolates forward bugs from anything in the optimizer trajectory, which is
+how the missing-`f` bug was pinned to gradients specifically.
+
+### 8. Save — line 87
+
+`state_dict` is moved to CPU so it loads anywhere. `cfg` is a pickled
+dataclass, which is why every reader passes `weights_only=False`.
+
+### A sanity check worth knowing
+
+At initialisation the model should predict roughly uniformly over 65
+characters, so the loss should start near `ln(65) = 4.174`. Observed:
+**4.4027** — just above, because `lm_head` is initialised to `normal(std=0.02)`
+rather than zeros, so the logits are not perfectly flat.
+
+Use this to triage a broken run:
+
+| First loss | Likely cause |
+|---|---|
+| ~4.17 | correct |
+| ~11 (`ln(65535)`?) | vocab mapping or embedding init is wrong |
+| ~0.5 | targets are leaking into the inputs |
+| `nan` | learning rate or init blew up on step 0 |
+
+Ending at 2.516 means it learned character-level statistics, which is about
+what 100 steps buys.
+
+### Open questions / things to improve
+
+- Weight decay currently hits biases and LayerNorm gains. Splitting into decay
+  and no-decay parameter groups would be more realistic, but changes the oracle
+  and so invalidates every saved comparison. Worth doing deliberately, with a
+  regenerated `reference.pt`, not by accident.
+- `get_batch` calls `.to(device, non_blocking=True)` on unpinned CPU tensors, so
+  `non_blocking` is effectively a no-op. Pinning the source would make it real.
+- The probe is a single fixed batch. A handful of probes at different steps
+  would localise forward bugs more precisely.
+- `loss.item()` every step syncs. An accumulate-on-device-and-sync-once variant
+  would be faster, at the cost of some timing honesty.
+
 ## Determinism is real — verify it yourself
 
 ```bash
