@@ -20,7 +20,7 @@ Every single bug found while building these labs was caught this way.
 ## Run it
 
 ```bash
-cd ~/shard-lab
+cd ~/ai/shard-lab
 .venv/bin/python lab0_reference.py
 ```
 
@@ -39,7 +39,7 @@ train: 100 steps, global batch 32, fp32
   step  99  loss 2.516004
 
 steady state: 3.24s for 90 steps (27.8 steps/s); first 10 skipped as warmup
-saved oracle -> /home/ubuntu/shard-lab/out/reference.pt
+saved oracle -> /home/ubuntu/ai/shard-lab/out/reference.pt
   probe loss 2.497602
 ```
 

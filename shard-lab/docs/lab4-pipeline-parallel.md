@@ -121,7 +121,7 @@ Copy one back and open it in [Perfetto](https://ui.perfetto.dev) or
 `chrome://tracing`:
 
 ```bash
-scp lambda-gpu:~/shard-lab/out/pp_micro1_rank0.json .
+scp lambda-gpu:~/ai/shard-lab/out/pp_micro1_rank0.json .
 ```
 
 At micro=1 you see a single compute burst per rank separated by long NCCL

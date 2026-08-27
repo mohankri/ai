@@ -40,7 +40,7 @@ runs any of this.
 
 ```bash
 ssh lambda-gpu
-cd ~/shard-lab
+cd ~/ai/shard-lab
 ```
 
 The environment already exists. To rebuild it from scratch:
@@ -50,7 +50,7 @@ The environment already exists. To rebuild it from scratch:
 curl -LsSf https://astral.sh/uv/install.sh | sh
 export PATH=$HOME/.local/bin:$PATH
 
-cd ~/shard-lab
+cd ~/ai/shard-lab
 uv venv --python 3.12 .venv
 # UV_NO_CACHE because / had only ~12 GB free
 UV_NO_CACHE=1 uv pip install --python .venv/bin/python \
@@ -84,7 +84,7 @@ Blackwell Ultra rather than assuming your wheel targets your exact arch.
 Lab 0 is single-process. Everything else uses all four GPUs.
 
 ```bash
-cd ~/shard-lab
+cd ~/ai/shard-lab
 .venv/bin/python lab0_reference.py                              # must run first
 .venv/bin/torchrun --standalone --nproc_per_node=4 lab1_collectives.py
 .venv/bin/torchrun --standalone --nproc_per_node=4 lab2_ddp.py
