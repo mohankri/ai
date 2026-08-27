@@ -41,6 +41,7 @@ def main():
 
     data, vocab_size = load_data()
     cfg = GPTConfig(vocab_size=vocab_size)
+    # Build reproducible weights on CPU, then move the complete model to GPU 0.
     model = build_model(cfg).to(device)
 
     n_params = sum(p.numel() for p in model.parameters())

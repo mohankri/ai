@@ -367,6 +367,12 @@ def build_model(cfg: GPTConfig | None = None, seed: int = 0) -> GPT:
 # data
 # ---------------------------------------------------------------------------
 def load_data():
+    """Load the corpus and encode each character as an integer token.
+
+    The vocabulary is the sorted set of unique characters found in
+    ``data/input.txt``.  Returns the encoded token tensor and the vocabulary
+    size.
+    """
     with open(DATA_PATH, "r", encoding="utf-8") as f:
         text = f.read()
     chars = sorted(set(text))

@@ -142,6 +142,51 @@ stoi = {c: i for i, c in enumerate(chars)}
 runs, silently changing the data and therefore the loss curve. Returns
 `vocab=65`, which overrides the `GPTConfig` default at line 43.
 
+That override happens here:
+
+```python
+data, vocab_size = load_data()
+cfg = GPTConfig(vocab_size=vocab_size)
+```
+
+With this corpus, `vocab_size` is `65`, so the second line is equivalent to
+`GPTConfig(vocab_size=65)`. The remaining configuration values keep their
+defaults: 8 transformer blocks, 8 attention heads, `d_model=512`, and a
+256-token context window.
+
+The vocabulary size controls both ends of the model. The token IDs produced by
+`load_data()` range from `0` through `64`, and the model creates an embedding
+table with shape `(65, 512)` and an output layer with 65 scores. Each output
+score represents one possible character the model may predict next.
+
+The main configuration values and their relationships are:
+
+```mermaid
+flowchart TD
+  Config["GPTConfig"]
+
+  Config --> Vocab["vocab_size = 65<br/>65 unique characters<br/>Token IDs: 0-64"]
+  Config --> Layers["n_layer = 8<br/>8 Transformer blocks"]
+  Config --> Heads["n_head = 8<br/>8 attention heads"]
+  Config --> Model["d_model = 512<br/>512 values per token"]
+  Config --> Context["block_size = 256<br/>Maximum sequence length"]
+
+  Vocab --> Embedding["Token embedding<br/>Shape: 65 x 512"]
+  Model --> Embedding
+
+  Layers --> Transformer["8 Transformer blocks"]
+  Heads --> Attention["Attention<br/>8 heads x 64 dimensions"]
+  Model --> Attention
+
+  Context --> Position["Position embedding<br/>Shape: 256 x 512"]
+  Model --> Position
+
+  Transformer --> Output["Hidden states<br/>Shape: batch x 256 x 512"]
+  Output --> Head["lm_head<br/>512 -> 65"]
+  Vocab --> Head
+  Head --> Prediction["65 scores<br/>One score per possible character"]
+```
+
 ### 3. `build_model(cfg).to(device)` — line 44
 
 The re-seed is the critical part:
@@ -160,6 +205,18 @@ oracle comparison.
 
 It builds on **CPU** and then moves to the device, so initialisation uses CPU
 RNG and cannot be perturbed by per-GPU RNG state.
+
+The call in Lab 0 combines both operations:
+
+```python
+model = build_model(cfg).to(device)
+```
+
+`build_model(cfg)` creates the GPT model using the configuration and returns a
+fully initialised model whose parameters are still on the CPU. The chained
+`.to(device)` moves the model's parameters and buffers to `device`, which is
+`cuda:0` in this lab. After this line, inputs must also be placed on the same
+GPU before being passed to the model.
 
 `GPT._init` touches only `Linear` and `Embedding` (`normal_(std=0.02)`, zero
 bias). LayerNorms are intentionally skipped, keeping PyTorch's default
