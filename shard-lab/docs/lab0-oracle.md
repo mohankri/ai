@@ -187,6 +187,45 @@ flowchart TD
   Head --> Prediction["65 scores<br/>One score per possible character"]
 ```
 
+The complete forward path is:
+
+```mermaid
+flowchart TD
+  Input["Token IDs<br/>batch x sequence"] --> WTE["wte<br/>Embedding: 65 x 512"]
+  Positions["Positions<br/>0 ... 255"] --> WPE["wpe<br/>Embedding: 256 x 512"]
+  WTE --> Add["Token + position embeddings<br/>batch x sequence x 512"]
+  WPE --> Add
+
+  Add --> Block0["Block 1 of 8"]
+  Block0 --> BlockDots["... 6 identical blocks ..."]
+  BlockDots --> Block7["Block 8 of 8"]
+
+  subgraph TransformerBlock["Each pre-norm Transformer block"]
+    BlockInput["x"] --> LN1["LayerNorm<br/>512"]
+    LN1 --> Q["q_proj<br/>512 -> 512"]
+    LN1 --> K["k_proj<br/>512 -> 512"]
+    LN1 --> V["v_proj<br/>512 -> 512"]
+    Q --> Scores["Causal attention<br/>8 heads x 64 dimensions"]
+    K --> Scores
+    V --> Attend["Attention-weighted values"]
+    Scores --> Attend
+    Attend --> O["o_proj<br/>512 -> 512"]
+    O --> AddAttn["Residual add<br/>x + attention"]
+    BlockInput --> AddAttn
+    AddAttn --> LN2["LayerNorm<br/>512"]
+    LN2 --> Up["MLP up<br/>512 -> 2048"]
+    Up --> GELU["GELU"]
+    GELU --> Down["MLP down<br/>2048 -> 512"]
+    Down --> AddMLP["Residual add<br/>x + MLP"]
+    AddAttn --> AddMLP
+  end
+
+  Block7 --> FinalNorm["ln_f<br/>LayerNorm: 512"]
+  FinalNorm --> LMHead["lm_head<br/>Linear: 512 -> 65<br/>untied from wte"]
+  LMHead --> Logits["Logits<br/>batch x sequence x 65"]
+  Logits --> NextToken["Next-token scores"]
+```
+
 ### 3. `build_model(cfg).to(device)` — line 44
 
 The re-seed is the critical part:
